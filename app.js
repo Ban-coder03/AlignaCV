@@ -1,4 +1,4 @@
-/**
+/** app.js
  * Aligna CV · Controlador de interfaz.
  * No guarda CV ni ofertas en localStorage: solo preferencias de modo, tema y URL.
  * La entrada del usuario y la respuesta del backend siempre se insertan como texto,
@@ -123,10 +123,10 @@
   function validateInputs() {
     const cv = el.cvText.value.trim();
     const job = el.jobText.value.trim();
-    if (cv.length < 60) {
+    if (cv.length < 100) {
       el.cvText.setAttribute('aria-invalid', 'true');
       el.cvText.focus();
-      throw new Error('Escribe al menos 60 caracteres de contenido real de tu CV.');
+      throw new Error('Escribe al menos 100 caracteres de contenido real de tu CV.');
     }
     if (job.length < 50) {
       el.jobText.setAttribute('aria-invalid', 'true');
@@ -445,7 +445,7 @@
     const prefs = readPrefs();
     el.backendUrl.value = typeof prefs.apiBaseUrl === 'string' ? prefs.apiBaseUrl : API.API_BASE_URL;
     setTheme(prefs.theme === 'dark' ? 'dark' : 'light');
-    setDemoMode(prefs.demo !== false);
+    setDemoMode(typeof prefs.demo === 'boolean' ? prefs.demo : location.protocol === 'file:'); // en la web, por defecto usa el backend
     updateCounts();
     showView('empty');
     initDragAndDrop();
