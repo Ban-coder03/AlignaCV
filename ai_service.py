@@ -12,12 +12,14 @@ La API key se lee SOLO de variables de entorno (ver config.py). El SDK `anthropi
 importa de forma perezosa: en modo mock no hace falta tenerlo instalado.
 """
 
+import json
 import logging
 import time
 from typing import Any, Callable
 
 from pydantic import ValidationError
 
+import gemini_service
 from config import Settings, get_settings
 from errors import (
     AIAuthError,
@@ -161,6 +163,7 @@ async def run_analysis(
     req: AnalyzeRequest,
     settings: Settings | None = None,
     client_factory: Callable[[Settings], Any] | None = None,
+    gemini_client: Any = None,
 ) -> AnalysisResponse:
     settings = settings or get_settings()
     started = time.monotonic()
@@ -177,11 +180,14 @@ async def run_analysis(
         return AnalysisResponse(**result.model_dump(), meta=meta)
 
     # ---- Modo real -----------------------------------------------------------------------
-    if not settings.anthropic_api_key:
+    if not settings.active_api_key:
+        var = "GEMINI_API_KEY" if settings.ai_provider == "gemini" else "ANTHROPIC_API_KEY"
         raise AIConfigError(
-            "No hay API key configurada. Define ANTHROPIC_API_KEY en el entorno o en el archivo .env, "
+            f"No hay API key configurada. Define {var} en el entorno o en el archivo .env, "
             "o activa USE_MOCK_AI=true para probar sin clave."
         )
+    if settings.ai_provider == "gemini":
+        return await _run_gemini(req, settings, started, meta_base, gemini_client)
     client = (client_factory or _default_client_factory)(settings)
     tool = build_tool()
     messages: list[dict[str, Any]] = [{"role": "user", "content": build_user_prompt(req)}]
@@ -249,3 +255,50 @@ def _quality_warnings(result: AnalysisResult, req: AnalyzeRequest, attempt: int)
     if lines and not any(ln[:60] in cv_lower for ln in lines):
         warnings.append("El fragmento original citado no se encontró literalmente en el CV; verifícalo.")
     return warnings
+
+
+# ============================================================================================
+# Proveedor Gemini (JSON estructurado por esquema + validación Pydantic + reintentos)
+# ============================================================================================
+async def _run_gemini(req: AnalyzeRequest, settings: Settings, started: float, meta_base: dict[str, Any], client: Any) -> AnalysisResponse:
+    schema = gemini_service.prepare_schema(AnalysisResult.model_json_schema())
+    system = (
+        SYSTEM_PROMPT.replace("llamando a la herramienta `submit_cv_analysis`. Nunca escribas texto libre.",
+                              "con UN ÚNICO objeto JSON que cumpla el esquema. Nada de texto fuera del JSON.")
+        + "\nEl JSON debe seguir EXACTAMENTE este esquema:\n" + json.dumps(schema, ensure_ascii=False)
+    )
+    user_prompt = build_user_prompt(req).replace(f"llama a `{TOOL_NAME}`.", "devuelve el objeto JSON.")
+    contents: list[dict[str, Any]] = [{"role": "user", "parts": [{"text": user_prompt}]}]
+    deadline = started + settings.ai_total_timeout_seconds
+    attempts = settings.ai_output_retries + 1
+
+    for attempt in range(1, attempts + 1):
+        text, finish = await gemini_service.generate(settings, system, contents, schema, deadline, client)
+        problem: str | None = None
+        if finish == "MAX_TOKENS":
+            problem = "La respuesta se truncó por límite de tokens: sé más conciso (menos mejoras y textos más cortos)."
+        elif not text.strip():
+            problem = f"La respuesta llegó vacía o bloqueada ({finish}). Devuelve el objeto JSON."
+        else:
+            try:
+                data = gemini_service.parse_json_text(text)
+                result = AnalysisResult.model_validate(data)
+            except json.JSONDecodeError:
+                problem = "La salida no es JSON válido. Devuelve únicamente el objeto JSON."
+            except ValidationError as exc:
+                problem = _format_validation_error(exc)
+            else:
+                meta = AnalysisMeta(
+                    mode="live", model=settings.gemini_model,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    warnings=_quality_warnings(result, req, attempt), **meta_base,
+                )
+                return AnalysisResponse(**result.model_dump(), meta=meta)
+
+        logger.warning("Salida de Gemini inválida (intento %d/%d): %s", attempt, attempts, problem.splitlines()[0])
+        contents = contents + [
+            {"role": "model", "parts": [{"text": text[:6000] or "{}"}]},
+            {"role": "user", "parts": [{"text": problem}]},
+        ]
+
+    raise AIInvalidOutputError(f"El modelo no produjo una respuesta válida tras {attempts} intentos. Inténtalo de nuevo.")

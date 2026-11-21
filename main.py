@@ -113,7 +113,7 @@ async def health() -> HealthResponse:
         version=APP_VERSION,
         mode="mock" if s.use_mock_ai else "live",
         ai_configured=s.ai_configured,
-        model=None if s.use_mock_ai else s.anthropic_model,
+        model=None if s.use_mock_ai else s.active_model,
     )
 
 

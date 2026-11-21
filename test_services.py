@@ -221,3 +221,110 @@ def test_improvements_sorted_by_priority():
     data["improvements"] = [dict(base, priority="low"), dict(base, priority="high"), dict(base, priority="medium")]
     got = [i.priority for i in AnalysisResult.model_validate(data).improvements]
     assert got == ["high", "medium", "low"]
+
+
+# ---------------- Gemini ----------------
+import gemini_service
+
+
+class FakeResp:
+    def __init__(self, status, payload=None, text=""):
+        self.status_code, self._p, self.text = status, payload, text
+
+    def json(self):
+        return self._p
+
+
+def gem_ok(data, finish="STOP"):
+    return FakeResp(200, {"candidates": [{"content": {"parts": [{"text": data if isinstance(data, str) else json.dumps(data)}]}, "finishReason": finish}]})
+
+
+class FakeHttp:
+    def __init__(self, responses):
+        self.responses, self.calls = list(responses), []
+
+    async def post(self, url, headers=None, json=None):
+        self.calls.append((url, headers, json))
+        r = self.responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    async def aclose(self):
+        pass
+
+
+def gsettings(**kw):
+    return settings(ai_provider="gemini", gemini_api_key="AIza-test-key", gemini_model="gem-x", **kw)
+
+
+def test_gemini_schema_is_inlined():
+    sch = gemini_service.prepare_schema(AnalysisResult.model_json_schema())
+    dumped = json.dumps(sch)
+    assert "$ref" not in dumped and "$defs" not in dumped and "anyOf" not in dumped
+    assert sch["properties"]["score_breakdown"]["properties"]["technical_match"]["maximum"] == 100
+    ex = sch["properties"]["improvements"]["items"]["properties"]["example"]
+    assert "null" in ex["type"]
+
+
+def test_gemini_success_and_key_in_header_only():
+    http = FakeHttp([gem_ok(VALID)])
+    r = run(run_analysis(req(), gsettings(), gemini_client=http))
+    assert r.meta.model == "gem-x" and r.compatibility_score == 62
+    url, headers, body = http.calls[0]
+    assert "AIza" not in url and headers["x-goog-api-key"] == "AIza-test-key"
+    assert body["generationConfig"]["responseFormat"]["text"]["mimeType"] == "application/json"
+    assert "<cv>" in body["contents"][0]["parts"][0]["text"]
+
+
+def test_gemini_fenced_json_and_retry_on_invalid():
+    http = FakeHttp([gem_ok("no es json"), gem_ok(dict(VALID, compatibility_score=999)), gem_ok("```json\n" + json.dumps(VALID) + "\n```")])
+    r = run(run_analysis(req(), gsettings(), gemini_client=http))
+    assert len(http.calls) == 3 and "3 intentos" in r.meta.warnings[0]
+    assert http.calls[2][2]["contents"][-1]["role"] == "user"
+
+
+def test_gemini_gives_up():
+    http = FakeHttp([gem_ok("x")] * 3)
+    with pytest.raises(AIInvalidOutputError):
+        run(run_analysis(req(), gsettings(), gemini_client=http))
+
+
+def test_gemini_truncated_and_blocked_retry():
+    blocked = FakeResp(200, {"promptFeedback": {"blockReason": "SAFETY"}})
+    http = FakeHttp([gem_ok(VALID, finish="MAX_TOKENS"), blocked, gem_ok(VALID)])
+    assert run(run_analysis(req(), gsettings(), gemini_client=http)).compatibility_score == 62
+
+
+@pytest.mark.parametrize("status,text,expected", [
+    (400, "API key not valid. Please pass a valid API key. API_KEY_INVALID", AIAuthError),
+    (403, "forbidden", AIAuthError), (429, "quota", AIRateLimitError)])
+def test_gemini_http_errors_translated(status, text, expected):
+    http = FakeHttp([FakeResp(status, None, text)])
+    with pytest.raises(expected) as info:
+        run(run_analysis(req(), gsettings(ai_sdk_retries=0), gemini_client=http))
+    assert "AIza" not in info.value.message
+
+
+def test_gemini_retries_transient_then_ok():
+    http = FakeHttp([FakeResp(503, None, "busy"), gem_ok(VALID)])
+    assert run(run_analysis(req(), gsettings(ai_sdk_retries=1), gemini_client=http)).meta.mode == "live"
+
+
+def test_gemini_timeout_and_fallback_format():
+    class TimeoutException(Exception):
+        pass
+    http = FakeHttp([TimeoutException("slow")])
+    with pytest.raises(AITimeoutError):
+        run(run_analysis(req(), gsettings(ai_sdk_retries=0), gemini_client=http))
+    gemini_service._format_style["value"] = "response_format"
+    http = FakeHttp([FakeResp(400, None, 'Unknown name "responseFormat"'), gem_ok(VALID)])
+    run(run_analysis(req(), gsettings(), gemini_client=http))
+    assert "responseJsonSchema" in http.calls[1][2]["generationConfig"]
+    gemini_service._format_style["value"] = "response_format"
+
+
+def test_gemini_missing_key():
+    with pytest.raises(AIConfigError) as info:
+        run(run_analysis(req(), settings(ai_provider="gemini", gemini_api_key=None)))
+    assert "GEMINI_API_KEY" in info.value.message

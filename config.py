@@ -16,6 +16,7 @@ load_dotenv(override=False)
 logger = logging.getLogger("cv_analyzer.config")
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 _TRUE = {"1", "true", "yes", "on", "si", "sí"}
 _PLACEHOLDER_MARKERS = ("replace", "your_", "your-", "xxxx", "changeme", "<")
 
@@ -67,10 +68,21 @@ class Settings:
     cors_origins: tuple[str, ...]
     max_upload_bytes: int
     rate_limit_per_minute: int         # 0 = desactivado
+    ai_provider: str = "anthropic"     # "anthropic" | "gemini"
+    gemini_api_key: str | None = None
+    gemini_model: str = DEFAULT_GEMINI_MODEL
+
+    @property
+    def active_api_key(self) -> str | None:
+        return self.gemini_api_key if self.ai_provider == "gemini" else self.anthropic_api_key
+
+    @property
+    def active_model(self) -> str:
+        return self.gemini_model if self.ai_provider == "gemini" else self.anthropic_model
 
     @property
     def ai_configured(self) -> bool:
-        return self.use_mock_ai or self.anthropic_api_key is not None
+        return self.use_mock_ai or self.active_api_key is not None
 
 
 def get_settings() -> Settings:
@@ -82,7 +94,15 @@ def get_settings() -> Settings:
     if temperature_raw:
         temperature = _env_number("AI_TEMPERATURE", 0.2, 0.0, 1.0)
 
+    provider = (os.getenv("AI_PROVIDER") or "anthropic").strip().lower()
+    if provider not in ("anthropic", "gemini"):
+        logger.warning("AI_PROVIDER inválido (%r); se usa 'anthropic'.", provider)
+        provider = "anthropic"
+
     return Settings(
+        ai_provider=provider,
+        gemini_api_key=_clean_api_key(os.getenv("GEMINI_API_KEY")),
+        gemini_model=(os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip(),
         use_mock_ai=_env_bool("USE_MOCK_AI", False),
         anthropic_api_key=_clean_api_key(os.getenv("ANTHROPIC_API_KEY")),
         anthropic_model=(os.getenv("ANTHROPIC_MODEL") or DEFAULT_MODEL).strip(),
