@@ -1,4 +1,4 @@
-/**
+/** api.js
  * Aligna CV · Capa de datos y motor de demostración.
  * Cambia API_BASE_URL o define window.API_BASE_URL antes de cargar este script.
  * Contrato HTTP:
@@ -18,10 +18,11 @@
 (() => {
   'use strict';
 
-  const API_BASE_URL = window.API_BASE_URL || 'http://127.0.0.1:8000';
+  // En la web (http/https) se usa el mismo dominio; abierto como archivo local, el backend de desarrollo.
+  const API_BASE_URL = window.API_BASE_URL || (/^https?:$/.test(location.protocol) ? location.origin : 'http://127.0.0.1:8000');
   let baseUrl = API_BASE_URL.replace(/\/+$/, '');
-  const TIMEOUT_MS = 25000;
-  const MAX_FILE_BYTES = 8 * 1024 * 1024;
+  const TIMEOUT_MS = 95000; // el backend puede tardar hasta ~90 s
+  const MAX_FILE_BYTES = 4 * 1024 * 1024; // límite del backend en Vercel
 
   class ApiError extends Error {
     constructor(message, status = null) {
@@ -257,33 +258,58 @@
     const score = percent(data.score ?? data.compatibility_score ?? data.match_score);
     if (score === null) throw new ApiError('El backend no devolvió un campo numérico "score" entre 0 y 100.');
     const rewriteRaw = data.rewrite || {};
+    const rs = data.rewritten_section && typeof data.rewritten_section === 'object' ? data.rewritten_section : null;
+    const needs = Array.isArray(rs?.needs_user_input) ? rs.needs_user_input.map(String).filter(Boolean) : [];
+    const warnings = Array.isArray(data.meta?.warnings) ? data.meta.warnings.map(String).filter(Boolean) : [];
     const selected = SECTION_LABELS[request.target_section] ? request.target_section : 'summary';
     const rawSuggestions = data.suggestions ?? data.improvements;
     const suggestions = Array.isArray(rawSuggestions) ? rawSuggestions.slice(0, 30).map(item => {
       if (typeof item === 'string') return { title: item, detail: '', impact: 'medium' };
+      const level = item?.impact ?? item?.priority;
+      if (item?.what_to_change) { // formato del backend: section / what_to_change / why / example
+        const extra = [item.why ? `Por qué: ${item.why}` : '', item.example ? `Ejemplo: ${item.example}` : ''].filter(Boolean);
+        return { title: String(item.section || 'Mejora sugerida'),
+          detail: [String(item.what_to_change), ...extra].join('\n'),
+          impact: ['high', 'medium', 'low'].includes(level) ? level : 'medium' };
+      }
       return { title: String(item?.title || item?.suggestion || 'Mejora sugerida'),
         detail: String(item?.detail || item?.reason || item?.description || ''),
-        impact: ['high', 'medium', 'low'].includes(item?.impact) ? item.impact : 'medium' };
+        impact: ['high', 'medium', 'low'].includes(level) ? level : 'medium' };
     }) : [];
     return {
       score,
       summary: String(data.summary ?? data.executive_summary ?? 'Análisis completado. Revisa el detalle de las competencias y las recomendaciones.'),
       breakdown: {
-        technical: percent(data.breakdown?.technical ?? data.scores?.technical),
-        soft: percent(data.breakdown?.soft ?? data.scores?.soft),
-        relevance: percent(data.breakdown?.relevance ?? data.scores?.relevance)
+        technical: percent(data.breakdown?.technical ?? data.scores?.technical ?? data.score_breakdown?.technical_match),
+        soft: percent(data.breakdown?.soft ?? data.scores?.soft ?? data.score_breakdown?.soft_skills_match),
+        relevance: percent(data.breakdown?.relevance ?? data.scores?.relevance ?? data.score_breakdown?.experience_impact)
       },
       keywords: { technical: normalizedKeywordGroup(data, 'technical'), soft: normalizedKeywordGroup(data, 'soft') },
       suggestions,
       rewrite: {
-        section: String(rewriteRaw.section || SECTION_LABELS[selected]),
-        before: String(rewriteRaw.before ?? getSectionText(request.cv_text, selected)),
-        after: String(rewriteRaw.after ?? data.rewritten_section ?? ''),
-        note: String(rewriteRaw.note || 'Revisa la exactitud de la redacción propuesta antes de incorporarla a tu CV.')
+        section: String(rewriteRaw.section || rs?.section_name || SECTION_LABELS[selected]),
+        before: String(rewriteRaw.before || rs?.original_excerpt || getSectionText(request.cv_text, selected)),
+        after: String(rewriteRaw.after ?? rs?.improved_text ?? (typeof data.rewritten_section === 'string' ? data.rewritten_section : '')),
+        note: String(rewriteRaw.note || [rs?.rationale, needs.length ? `Completa o verifica: ${needs.join(' · ')}` : '']
+          .filter(Boolean).join('\n\n') || 'Revisa la exactitud de la redacción propuesta antes de incorporarla a tu CV.')
       },
       source: 'backend',
-      disclaimer: String(data.disclaimer || 'Puntaje orientativo. No garantiza una entrevista ni contratación.')
+      disclaimer: [String(data.disclaimer || 'Puntaje orientativo. No garantiza una entrevista ni contratación.'), ...warnings].join(' ')
     };
+  }
+
+  /** Convierte el error del backend en un texto legible (nunca "[object Object]"). */
+  function describeError(payload, status) {
+    const err = payload?.error;
+    if (err && typeof err === 'object') {
+      const fields = Array.isArray(err.details)
+        ? err.details.map(d => (d?.field ? `${d.field}: ${d.message}` : d?.message)).filter(Boolean).join('; ')
+        : '';
+      return [err.message, fields].filter(Boolean).join(' — ') || `Error HTTP ${status}.`;
+    }
+    if (typeof payload?.detail === 'string') return payload.detail;
+    if (Array.isArray(payload?.detail)) return payload.detail.map(d => d?.msg).filter(Boolean).join('; ') || 'Verifica los campos enviados.';
+    return typeof payload?.message === 'string' ? payload.message : `Error HTTP ${status}.`;
   }
 
   async function send(path, { body, headers, signal } = {}) {
@@ -300,14 +326,11 @@
       try { payload = rawText ? JSON.parse(rawText) : {}; }
       catch { throw new ApiError('El servidor devolvió texto en lugar de JSON. Revisa la respuesta de FastAPI.', response.status); }
       if (!response.ok) {
-        const detail = typeof payload?.detail === 'string' ? payload.detail
-          : Array.isArray(payload?.detail) ? 'Verifica los campos enviados y el esquema esperado por FastAPI.'
-            : String(payload?.message || payload?.error || `Error HTTP ${response.status}.`);
-        throw new ApiError(`El backend rechazó la solicitud (${response.status}): ${detail}`, response.status);
+        throw new ApiError(describeError(payload, response.status), response.status);
       }
       return payload;
     } catch (error) {
-      if (timedOut) throw new ApiError('El backend tardó demasiado en responder (25 s). Verifica que FastAPI esté activo.');
+      if (timedOut) throw new ApiError('El backend tardó demasiado en responder (95 s). Verifica que FastAPI esté activo.');
       if (controller.signal.aborted || error?.name === 'AbortError') throw new ApiError('Operación cancelada.');
       if (error instanceof ApiError) throw error;
       throw new ApiError('No se pudo conectar con FastAPI. Comprueba la URL, que el servidor esté encendido y su configuración CORS. Activa «Modo demo» para analizar sin servidor.');
@@ -334,7 +357,7 @@
     const extension = file.name.toLowerCase().split('.').pop();
     if (!['txt', 'pdf', 'docx'].includes(extension)) throw new ApiError('Formato no compatible. Usa .txt, .pdf o .docx.');
     if (file.size === 0) throw new ApiError('El archivo está vacío.');
-    if (file.size > MAX_FILE_BYTES) throw new ApiError('El archivo supera el límite de 8 MB.');
+    if (file.size > MAX_FILE_BYTES) throw new ApiError('El archivo supera el límite de 4 MB.');
     if (extension === 'txt') {
       const result = await file.text();
       if (!result.trim()) throw new ApiError('El archivo TXT no contiene texto legible.');
