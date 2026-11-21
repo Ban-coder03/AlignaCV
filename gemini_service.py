@@ -11,6 +11,7 @@ import asyncio
 import copy
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -21,6 +22,7 @@ logger = logging.getLogger("cv_analyzer.gemini")
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 _UNSUPPORTED_KEYS = {"title", "default", "$defs", "examples", "minLength", "maxLength", "pattern"}
+STYLES = ["response_format", "classic", "json_only"]   # de más a menos estricto
 _format_style = {"value": "response_format"}   # se recuerda cuál formato aceptó la API
 
 
@@ -61,10 +63,22 @@ def _build_body(system: str, contents: list[dict[str, Any]], schema: dict[str, A
         config["temperature"] = settings.ai_temperature
     if style == "response_format":
         config["responseFormat"] = {"text": {"mimeType": "application/json", "schema": schema}}
-    else:  # formato clásico
+    elif style == "classic":
         config["responseMimeType"] = "application/json"
         config["responseJsonSchema"] = schema
+    else:  # json_only: solo fuerza JSON; el esquema ya va en las instrucciones del sistema
+        config["responseMimeType"] = "application/json"
     return {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents, "generationConfig": config}
+
+
+def provider_message(text: str) -> str:
+    """Mensaje de error de Gemini, truncado y sin ninguna clave (seguro para mostrar)."""
+    try:
+        msg = json.loads(text).get("error", {}).get("message") or ""
+    except Exception:  # noqa: BLE001
+        msg = text
+    msg = re.sub(r"AIza[0-9A-Za-z_\-]{10,}", "[clave oculta]", str(msg))
+    return " ".join(msg.split())[:300]
 
 
 def _status_error(status: int, text: str) -> Exception:
@@ -73,9 +87,13 @@ def _status_error(status: int, text: str) -> Exception:
         return AIAuthError()
     if status == 429:
         return AIRateLimitError("Se alcanzó el límite del plan gratuito de Gemini. Espera un momento e inténtalo de nuevo.")
+    detail = provider_message(text)
+    suffix = f" Detalle de Gemini: {detail}" if detail else ""
+    if status == 404:
+        return AIUpstreamError(f"Gemini no encontró el modelo configurado (GEMINI_MODEL).{suffix}")
     if status == 400:
-        return AIUpstreamError("Gemini rechazó la solicitud (revisa GEMINI_MODEL y el tamaño de la entrada).")
-    return AIUpstreamError()
+        return AIUpstreamError(f"Gemini rechazó la solicitud.{suffix}")
+    return AIUpstreamError(f"Gemini devolvió un error (HTTP {status}).{suffix}")
 
 
 def _default_client(settings: Settings) -> Any:
@@ -126,12 +144,12 @@ async def generate(
             if status == 200:
                 return _extract_text(resp)
             text = (getattr(resp, "text", "") or "")[:2000]
-            if status == 400 and style == "response_format" and any(k in text for k in ("responseFormat", "Unknown name", "Invalid JSON payload")):
-                logger.info("Gemini no acepta 'responseFormat'; se usa el formato clásico.")
-                style = _format_style["value"] = "classic"
+            logger.warning("Gemini respondió HTTP %s (formato %s): %s", status, style, provider_message(text))
+            if status == 400 and STYLES.index(style) < len(STYLES) - 1 and not _is_key_error(text):
+                style = _format_style["value"] = STYLES[STYLES.index(style) + 1]
+                logger.info("Se reintenta con el formato de salida '%s'.", style)
                 attempt -= 1
                 continue
-            logger.warning("Gemini respondió HTTP %s", status)
             if status in (429, 500, 502, 503, 504) and attempt <= settings.ai_sdk_retries:
                 await asyncio.sleep(min(2 ** attempt, 6))
                 continue
@@ -139,6 +157,11 @@ async def generate(
     finally:
         if own_client:
             await client.aclose()
+
+
+def _is_key_error(text: str) -> bool:
+    low = text.lower()
+    return "api_key_invalid" in low or "api key not valid" in low
 
 
 def _extract_text(resp: Any) -> tuple[str, str | None]:

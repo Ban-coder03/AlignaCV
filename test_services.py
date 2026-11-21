@@ -324,7 +324,47 @@ def test_gemini_timeout_and_fallback_format():
     gemini_service._format_style["value"] = "response_format"
 
 
+def test_gemini_walks_all_formats_and_surfaces_provider_message():
+    gemini_service._format_style["value"] = "response_format"
+    body = json.dumps({"error": {"message": "Invalid value at schema AIzaSyABCDEFGHIJKLMNOP"}})
+    http = FakeHttp([FakeResp(400, None, body)] * 3)
+    with pytest.raises(Exception) as info:
+        run(run_analysis(req(), gsettings(ai_sdk_retries=0), gemini_client=http))
+    assert len(http.calls) == 3
+    cfgs = [c[2]["generationConfig"] for c in http.calls]
+    assert "responseFormat" in cfgs[0] and "responseJsonSchema" in cfgs[1]
+    assert "responseJsonSchema" not in cfgs[2] and cfgs[2]["responseMimeType"] == "application/json"
+    assert "Invalid value at schema" in info.value.message and "AIzaSy" not in info.value.message
+    gemini_service._format_style["value"] = "response_format"
+
+
+def test_gemini_json_only_fallback_succeeds():
+    gemini_service._format_style["value"] = "response_format"
+    http = FakeHttp([FakeResp(400, None, "bad"), FakeResp(400, None, "bad"), gem_ok(VALID)])
+    assert run(run_analysis(req(), gsettings(ai_sdk_retries=0), gemini_client=http)).compatibility_score == 62
+    assert gemini_service._format_style["value"] == "json_only"
+    gemini_service._format_style["value"] = "response_format"
+
+
+def test_gemini_404_model_message():
+    http = FakeHttp([FakeResp(404, None, json.dumps({"error": {"message": "models/x is not found"}}))])
+    with pytest.raises(Exception) as info:
+        run(run_analysis(req(), gsettings(ai_sdk_retries=0), gemini_client=http))
+    assert "GEMINI_MODEL" in info.value.message and "not found" in info.value.message
+
+
 def test_gemini_missing_key():
     with pytest.raises(AIConfigError) as info:
         run(run_analysis(req(), settings(ai_provider="gemini", gemini_api_key=None)))
     assert "GEMINI_API_KEY" in info.value.message
+
+
+def test_target_section_aliases():
+    for raw, expected in [("summary", "professional_summary"), ("Resumen profesional", "professional_summary"),
+                          ("Experiencia", "experience"), ("habilidades", "skills"), ("Proyectos", "projects"),
+                          ("experience", "experience")]:
+        assert req(target_section=raw).target_section.value == expected
+    for raw in ("", "auto", None):
+        assert req(target_section=raw).target_section is None
+    with pytest.raises(ValidationError):
+        req(target_section="cualquier cosa rara")
