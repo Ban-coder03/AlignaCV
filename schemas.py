@@ -49,6 +49,30 @@ class OutputLanguage(str, Enum):
     en = "en"
 
 
+_SECTION_ALIASES = {
+    "professional_summary": "professional_summary", "summary": "professional_summary", "profile": "professional_summary",
+    "resumen": "professional_summary", "resumen profesional": "professional_summary", "perfil": "professional_summary",
+    "perfil profesional": "professional_summary", "about": "professional_summary",
+    "experience": "experience", "experiencia": "experience", "experiencia laboral": "experience",
+    "work_experience": "experience", "work experience": "experience",
+    "skills": "skills", "habilidades": "skills", "competencias": "skills", "tecnologias": "skills", "tecnologías": "skills",
+    "projects": "projects", "proyectos": "projects",
+}
+_NO_SECTION = {"", "auto", "none", "null", "ninguna", "any", "all", "todas", "cualquiera"}
+
+
+def _normalize_section(value: Any) -> Any:
+    """Acepta alias comunes (es/en) y valores vacíos como 'sin sección' (la IA elige)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        key = value.strip().lower().replace("-", "_")
+        if key in _NO_SECTION:
+            return None
+        return _SECTION_ALIASES.get(key, _SECTION_ALIASES.get(key.replace("_", " "), value))
+    return value
+
+
 def _clean_control_chars(value: Any) -> Any:
     """Elimina caracteres de control (salvo saltos de línea y tabulaciones) y bytes nulos."""
     if not isinstance(value, str):
@@ -104,6 +128,11 @@ class AnalyzeRequest(BaseModel):
         default=OutputLanguage.auto,
         description="Idioma de la respuesta. 'auto' usa el idioma de la oferta laboral.",
     )
+
+    @field_validator("target_section", mode="before")
+    @classmethod
+    def _section_aliases(cls, v: Any) -> Any:
+        return _normalize_section(v)
 
     @field_validator("cv_text", "job_description", mode="before")
     @classmethod
