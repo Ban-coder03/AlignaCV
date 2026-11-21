@@ -1,0 +1,9 @@
+# Dependencias de runtime. Versiones verificadas en desarrollo: marcadas con ==.
+fastapi>=0.115,<1.0
+uvicorn[standard]==0.54.0
+pydantic==2.13.5
+python-multipart==0.0.32
+pypdf==6.17.0
+python-docx==1.2.0
+python-dotenv==1.2.3
+anthropic>=0.40,<1.0
